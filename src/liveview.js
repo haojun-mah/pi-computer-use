@@ -37,15 +37,34 @@ export class LiveView {
 
   async start() {
     if (this.server) return this.url;
-    this.server = createServer((req, res) => this._route(req, res));
-    this.server.on("clientError", (_e, socket) => socket.destroy());
-    await new Promise((resolve, reject) => {
-      this.server.once("error", reject);
-      this.server.listen(this.port, "127.0.0.1", resolve);
-    });
-    this.url = `http://127.0.0.1:${this.port}/`;
-    this._loop();
-    return this.url;
+    // Bind the preferred port, but never fail the browser over a busy one: a
+    // second session, or a leftover daemon, must not take the page down with it.
+    const candidates = [this.port, ...Array.from({ length: 12 }, (_, i) => this.port + i + 1)];
+    let lastErr = null;
+    for (const port of candidates) {
+      const server = createServer((req, res) => this._route(req, res));
+      server.on("clientError", (_e, socket) => socket.destroy());
+      try {
+        await new Promise((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(port, "127.0.0.1", resolve);
+        });
+        this.server = server;
+        this.port = port;
+        this.url = `http://127.0.0.1:${port}/`;
+        this._loop();
+        return this.url;
+      } catch (err) {
+        lastErr = err;
+        server.close();
+      }
+    }
+    throw new Error(`could not bind a live view port (${candidates[0]}..${candidates.at(-1)}): ${lastErr?.message}`);
+  }
+
+  /** Rebind the routes' idea of the port; the URL uses whatever we actually got. */
+  get endpoint() {
+    return `http://127.0.0.1:${this.port}`;
   }
 
   pulse(ms = 1600) {

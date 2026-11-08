@@ -24,16 +24,30 @@ not need a display.
 
 ## The loop
 
-1. `browser_open` with a URL. It returns a **live view URL** — always tell the
-   user that URL, and the `ssh -L` command if they are remote.
+1. `browser_open` with a URL, **once per task**. It returns a **live view URL** —
+   always tell the user that URL, and the `ssh -L` command if they are remote.
 2. `browser_snapshot` to see structure. Every interactive element comes back
    with a numeric `ref`.
-3. Act with `browser_click` / `browser_type` / `browser_press` / `browser_scroll`,
-   passing the **ref**, not a guessed selector.
+3. Act with `browser_act` for sequences, or `browser_click` / `browser_type` /
+   `browser_press` / `browser_scroll` for one step, passing the **ref**, not a
+   guessed selector.
 4. `browser_snapshot` again to confirm what changed. Do not assume.
 
 `browser_screenshot` returns a PNG to you *and* mirrors what the human sees,
 including the ghost cursor — good for confirming a visual change landed.
+
+## The browser is long-lived — do not cycle it
+
+The single most common mistake is re-opening the browser. Do not do it.
+
+- Call `browser_open` **once**, at the start of the task.
+- Never call `browser_close` to tidy up, and never reopen between steps to "reset"
+  — the page, its cookies, its scroll position and its history are the point.
+- Finishing a turn does not close it. The browser runs in a detached daemon that
+  survives Pi exiting entirely, so a later turn or a brand-new session picks up the
+  exact same page. Just call `browser_snapshot`.
+- If you truly need a fresh page, `browser_open` again with a URL: it navigates the
+  existing browser instead of launching a second one.
 
 ## Targeting rules
 
@@ -49,8 +63,11 @@ navigation or a DOM change rather than reusing an old ref.
 
 ## Etiquette that keeps it watchable
 
-- One action per turn when the user is watching. Batching ten clicks removes the
-  very thing they asked to see.
+- Batch with `browser_act` when the steps are decided. A human watching a page sit
+  still between five separate tool calls is watching a hang, not an agent. Multiple
+  actions in one `browser_act` move continuously and read as intent.
+- Still snapshot between *decisions*. Burst the mechanical actions; think between
+  bursts.
 - Let `browser_open` keep `headless: false`. Only force headless for speed when
   nobody is looking.
 - `osPointer: true` additionally moves the real hardware cursor. It needs an X11

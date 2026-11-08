@@ -262,6 +262,52 @@ export class BrowserSession {
 
   // ---------------------------------------------------------------- actions ---
 
+  /**
+   * Run several actions in one pass, without returning to the caller between them.
+   *
+   * This is what makes the browser feel driven rather than poked: a navigation, a
+   * few clicks and a read can happen in one visible burst instead of one action
+   * per model turn. Each step takes the arguments of the tool it mirrors.
+   */
+  async act(steps, { stopOnError = false } = {}) {
+    const results = [];
+    await this.ensure();
+    for (const step of steps) {
+      const { action } = step;
+      try {
+        let r;
+        switch (action) {
+          case "click":
+            r = await this.click(step.target, { clickCount: step.double ? 2 : 1, label: step.label });
+            break;
+          case "type":
+            r = await this.type(step.target, step.text, { submit: step.submit, clear: step.clear });
+            break;
+          case "press":
+            r = await this.press(step.key);
+            break;
+          case "scroll":
+            r = await this.scroll({ direction: step.direction, amount: step.amount, target: step.target });
+            break;
+          case "navigate":
+            r = await this.navigate(step.url);
+            break;
+          case "wait":
+            await this.page.waitForTimeout(step.ms ?? 500);
+            r = this._describe(`waited ${step.ms ?? 500}ms`);
+            break;
+          default:
+            throw new Error(`unknown action ${JSON.stringify(action)}`);
+        }
+        results.push({ action, ok: true, summary: r.action });
+      } catch (err) {
+        results.push({ action, ok: false, summary: err.message ?? String(err) });
+        if (stopOnError) break;
+      }
+    }
+    return results;
+  }
+
   /** Move to a target, pause, then click it for real. */
   async click(target, { button = "left", clickCount = 1, label = null } = {}) {
     return this._serial(async () => {
@@ -271,11 +317,14 @@ export class BrowserSession {
       await this.page.waitForTimeout(this.opts.clickDelayMs);
       await this._ripple(t.x, t.y, clickCount === 2 ? "double" : "click");
       await this.page.mouse.move(t.x, t.y);
-      await this.page.mouse.down({ button });
-      await this.page.mouse.up({ button, clickCount });
       if (clickCount === 2) {
+        await this.page.mouse.down({ button, clickCount: 1 });
+        await this.page.mouse.up({ button, clickCount: 1 });
         await this.page.mouse.down({ button, clickCount: 2 });
         await this.page.mouse.up({ button, clickCount: 2 });
+      } else {
+        await this.page.mouse.down({ button });
+        await this.page.mouse.up({ button });
       }
       await this.page.waitForTimeout(60);
       await this._pulse();

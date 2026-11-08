@@ -2,22 +2,28 @@
  * pi-computer-use — a Pi extension that lets the model drive a browser a human
  * can actually watch.
  *
- * The gap this closes: Playwright MCP runs headless, so every click is invisible
- * and the human cannot follow along. Here the browser is headed, the pointer is
- * drawn into the page, and the whole thing streams to a viewer you open locally.
+ * Two things make this different from driving a headless session:
+ *
+ * 1. The browser is visible — headed Chromium with a ghost cursor drawn into the
+ *    page, plus a live view you can open in your own browser.
+ * 2. The browser is *persistent* — it runs in a detached daemon, not inside the
+ *    Pi process. Turns ending, sessions ending, and terminals closing all leave
+ *    it running. A browsing task is one continuous session, not a series of
+ *    launches.
  */
 
-import { BrowserSession } from "./session.js";
+import { DaemonClient } from "./daemon.js";
 import { readFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 
-/** One session per Pi process; tool calls share the tab the human is watching. */
-let session = null;
-
-function getSession(opts) {
-  if (!session) session = new BrowserSession(opts);
-  return session;
-}
+/**
+ * One client per Pi process, talking to a daemon that outlives us.
+ *
+ * Note what is deliberately absent: any shutdown hook. Pi exiting must not close
+ * the browser — that is the whole point. `browser_close` is the only thing that
+ * ends a session, and it is not part of the normal flow.
+ */
+const daemon = new DaemonClient();
 
 function text(s) {
   return { type: "text", text: s };
@@ -31,8 +37,13 @@ function ok(payload, summary) {
   return { content: [text(summary)], details: payload };
 }
 
+/** Accept "3" as well as 3, since models often stringify refs. */
+function targetOf(t) {
+  if (typeof t === "string" && /^\d+$/.test(t.trim())) return Number(t.trim());
+  return t;
+}
+
 function openUrl(url) {
-  // Cross-platform "open in the user's browser". Failure is fine: we print it.
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
   try {
@@ -45,86 +56,142 @@ function openUrl(url) {
   }
 }
 
-export default function piComputerUse(pi) {
-  pi.on("session_shutdown", async () => {
-    if (session) {
-      await session.close().catch(() => {});
-      session = null;
-    }
-  });
+const TARGET_SCHEMA = {
+  description: "Ref from browser_snapshot, a CSS selector, or {x,y} viewport coordinates",
+  anyOf: [
+    { type: "number", description: "Ref from browser_snapshot" },
+    { type: "string", description: "CSS selector" },
+    {
+      type: "object",
+      description: "Viewport coordinates",
+      properties: { x: { type: "number" }, y: { type: "number" } },
+      required: ["x", "y"],
+    },
+  ],
+};
 
-  // ------------------------------------------------------------- /browser ---
+export default function piComputerUse(pi) {
+  /* --------------------------------------------------------------- command -- */
 
   pi.registerCommand("browser", {
-    description: "Open the live view of Pi's browser, or report its status",
+    description: "Report the browser's status, live view URL, and daemon pid",
     handler: async (args, ctx) => {
-      if (!session || !session.running) {
-        ctx.ui.notify("No browser session yet — ask Pi to open a page first.", "warning");
+      const ping = await daemon.ping();
+      if (!ping) {
+        ctx.ui.notify("No browser daemon running — call browser_open to start one.", "warning");
         return;
       }
-      const url = session.liveView?.url;
-      if (!url) {
-        ctx.ui.notify("Live view is disabled (headless mode or port unavailable).", "warning");
+      const info = ping.info;
+      if (!info.running) {
+        ctx.ui.notify(`Daemon up (pid ${ping.pid}) but no page open yet. Call browser_open.`, "info");
         return;
       }
-      const info = session.info();
-      const opened = args?.includes("--open") ? openUrl(url) : false;
+      const url = info.liveView;
+      const opened = args?.includes("--open") && url ? openUrl(url) : false;
       ctx.ui.notify(
-        `${url}${opened ? " (opened locally)" : ""}\n` +
+        `${url ?? "(no live view)"}${opened ? " (opened locally)" : ""}\n` +
           `display: ${info.display ?? "none"} · ${info.actions} actions · ${info.url ?? "blank"}\n` +
-          `over SSH:  ssh -L ${session.opts.liveViewPort}:127.0.0.1:${session.opts.liveViewPort} <this-host>`,
+          `daemon: pid ${ping.pid} · survives this session\n` +
+          `over SSH: ssh -L 7799:127.0.0.1:7799 <this-host>`,
         "info",
       );
     },
   });
 
-  // ---------------------------------------------------------------- tools ---
+  /* ----------------------------------------------------------------- tools -- */
 
   pi.registerTool({
     name: "browser_open",
     label: "Open browser",
     description:
-      "Start a visible, human-watchable browser and load a URL. This is the entry point: " +
-      "it launches headed Chromium with a ghost cursor overlay and a live view stream.",
-    promptSnippet: "Open a visible browser session (headed Chromium with ghost cursor + live view)",
+      "Start the visible browser (headed Chromium, ghost cursor, live view) and load a URL. " +
+      "The browser is long-lived: it stays open across turns and sessions until you explicitly " +
+      "call browser_close. Call this once at the start of a task, not once per step.",
+    promptSnippet: "Open the persistent visible browser and load a URL",
     promptGuidelines: [
-      "Use browser_open before any other browser_* tool; the other tools start the browser implicitly if needed.",
-      "browser_open returns a liveView URL — tell the user they can watch at that URL and that over SSH they need `ssh -L <port>:127.0.0.1:<port>`.",
+      "Call browser_open once at the start of a browsing task. The browser persists across turns — never reopen it between steps.",
+      "browser_open returns a liveView URL; tell the user that URL, and over SSH the command `ssh -L 7799:127.0.0.1:7799 <host>`.",
+      "Do not call browser_close when a task ends or a step finishes; leave the browser open so the user can see the result and continue later.",
     ],
     parameters: {
       type: "object",
       properties: {
         url: { type: "string", description: "URL or search query to open" },
-        headless: { type: "boolean", description: "Force headless (no window). Default false so a human can watch." },
-        osPointer: { type: "boolean", description: "Also move the real OS cursor via XTest. Default false." },
+        headless: { type: "boolean", description: "Force headless. Default false so a human can watch." },
+        osPointer: { type: "boolean", description: "Also move the real OS cursor via XTest." },
         width: { type: "number", description: "Viewport width, default 1280" },
         height: { type: "number", description: "Viewport height, default 800" },
       },
       required: ["url"],
     },
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params) {
       try {
-        const s = getSession({
-          headless: params.headless ?? false,
-          osPointer: params.osPointer ?? false,
-          viewport: {
-            width: params.width ?? 1280,
-            height: params.height ?? 800,
-          },
-        });
-        await s.ensure();
-        const result = await s.navigate(params.url);
-        const info = s.info();
-        const lines = [result.action];
-        if (info.liveView) {
+        const res = await daemon.call("open", { url: params.url });
+        const info = res.info;
+        const lines = [res.action];
+        if (info?.liveView) {
           lines.push(`Live view: ${info.liveView}`);
-          lines.push(
-            `Remote? Forward the port: ssh -L ${s.opts.liveViewPort}:127.0.0.1:${s.opts.liveViewPort} <user>@<host>`,
-          );
+          lines.push("Remote? Forward the port: ssh -L 7799:127.0.0.1:7799 <user>@<host>");
         }
-        if (info.osPointer) lines.push("Real OS cursor: on");
-        if (!info.display) lines.push("Running headless — no window to watch.");
+        if (!info?.display) lines.push("Running headless — no window to watch.");
+        lines.push("The browser stays open across turns until browser_close.");
         return { content: [text(lines.join("\n"))], details: info };
+      } catch (err) {
+        return fail(err.message ?? String(err));
+      }
+    },
+  });
+
+  pi.registerTool({
+    name: "browser_act",
+    label: "Act",
+    description:
+      "Run several browser actions in one call, in order, in the live page. Use this instead of " +
+      "chaining individual browser_click / browser_type calls so a whole sequence happens in one " +
+      "visible burst rather than one model round-trip per click.",
+    promptSnippet: "Run a sequence of browser actions in one visible burst",
+    promptGuidelines: [
+      "Prefer browser_act over repeated single-action calls: pass every step of a sequence at once so the browser moves continuously instead of pausing for a round-trip between clicks.",
+      "Re-snapshot after browser_act before assuming the page state; the steps may have navigated.",
+    ],
+    parameters: {
+      type: "object",
+      properties: {
+        steps: {
+          type: "array",
+          description: "Ordered actions to perform",
+          items: {
+            type: "object",
+            properties: {
+              action: {
+                type: "string",
+                enum: ["click", "type", "press", "scroll", "navigate", "wait"],
+              },
+              target: TARGET_SCHEMA,
+              text: { type: "string", description: "For action=type" },
+              key: { type: "string", description: "For action=press" },
+              url: { type: "string", description: "For action=navigate" },
+              direction: { type: "string", enum: ["up", "down", "left", "right"] },
+              amount: { type: "number", description: "Scroll pixels" },
+              ms: { type: "number", description: "For action=wait" },
+              clear: { type: "boolean", description: "For action=type" },
+              submit: { type: "boolean", description: "For action=type" },
+              label: { type: "string", description: "Cursor label" },
+              double: { type: "boolean", description: "For action=click" },
+            },
+            required: ["action"],
+          },
+        },
+        stopOnError: { type: "boolean", description: "Abort the sequence on the first failure" },
+      },
+      required: ["steps"],
+    },
+    async execute(_id, params) {
+      try {
+        const steps = (params.steps ?? []).map((s) => ({ ...s, target: s.target === undefined ? undefined : targetOf(s.target) }));
+        const res = await daemon.call("act", { steps, stopOnError: params.stopOnError });
+        const lines = res.steps.map((s, i) => `${i + 1}. ${s.ok ? "ok" : "FAILED"} ${s.action} — ${s.summary}`);
+        return ok(res, lines.join("\n") || "No steps.");
       } catch (err) {
         return fail(err.message ?? String(err));
       }
@@ -150,9 +217,7 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        const snap = await s.snapshot({ maxElements: params.maxElements ?? 90 });
+        const snap = await daemon.call("snapshot", { maxElements: params.maxElements ?? 90 });
         const lines = [
           `${snap.title || "(untitled)"} — ${snap.url}`,
           `viewport ${snap.viewport.w}x${snap.viewport.h} · scroll ${snap.scroll.x},${snap.scroll.y}`,
@@ -187,24 +252,12 @@ export default function piComputerUse(pi) {
     promptSnippet: "Click a page element with a visible cursor animation",
     promptGuidelines: [
       "Target browser_click with a ref from browser_snapshot when possible; use {x,y} only for canvas or unlabelled areas.",
-      "After browser_click, run browser_snapshot again before assuming the page changed.",
+      "For a sequence of clicks, use browser_act instead so the browser is not paused between them.",
     ],
     parameters: {
       type: "object",
       properties: {
-        target: {
-          description: "Ref from browser_snapshot, a CSS selector, or {x,y} viewport coordinates",
-          anyOf: [
-            { type: "number", description: "Ref from browser_snapshot" },
-            { type: "string", description: "CSS selector" },
-            {
-              type: "object",
-              description: "Viewport coordinates",
-              properties: { x: { type: "number" }, y: { type: "number" } },
-              required: ["x", "y"],
-            },
-          ],
-        },
+        target: TARGET_SCHEMA,
         label: { type: "string", description: "Text to show next to the cursor" },
         double: { type: "boolean", description: "Double-click" },
       },
@@ -212,11 +265,7 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        let target = params.target;
-        if (typeof target === "string" && /^\d+$/.test(target.trim())) target = Number(target.trim());
-        const res = await s.click(target, { label: params.label, clickCount: params.double ? 2 : 1 });
+        const res = await daemon.call("click", { target: targetOf(params.target), label: params.label, double: params.double });
         return ok(res, res.action);
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -227,30 +276,12 @@ export default function piComputerUse(pi) {
   pi.registerTool({
     name: "browser_type",
     label: "Type",
-    description:
-      "Focus a field with a visible cursor move, then type with a human cadence. " +
-      "Set submit to press Enter afterwards.",
-    promptSnippet: "Type into a field, visibly, optionally submitting",
-    promptGuidelines: [
-      "Use browser_type with clear:true when replacing an existing value.",
-      "Set submit:true instead of a separate browser_press when the field is a search box or login form.",
-    ],
+    description: "Focus a field with a visible cursor move, then type at a human cadence.",
+    promptSnippet: "Type into a field with a visible cursor",
     parameters: {
       type: "object",
       properties: {
-        target: {
-          description: "Ref from browser_snapshot, a CSS selector, or {x,y} viewport coordinates",
-          anyOf: [
-            { type: "number", description: "Ref from browser_snapshot" },
-            { type: "string", description: "CSS selector" },
-            {
-              type: "object",
-              description: "Viewport coordinates",
-              properties: { x: { type: "number" }, y: { type: "number" } },
-              required: ["x", "y"],
-            },
-          ],
-        },
+        target: TARGET_SCHEMA,
         text: { type: "string", description: "Text to type" },
         clear: { type: "boolean", description: "Select-all and delete first" },
         submit: { type: "boolean", description: "Press Enter afterwards" },
@@ -259,11 +290,12 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        let target = params.target;
-        if (typeof target === "string" && /^\d+$/.test(target.trim())) target = Number(target.trim());
-        const res = await s.type(target, params.text, { clear: params.clear, submit: params.submit });
+        const res = await daemon.call("type", {
+          target: targetOf(params.target),
+          text: params.text,
+          clear: params.clear,
+          submit: params.submit,
+        });
         return ok(res, res.action);
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -285,9 +317,7 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        const res = await s.press(params.key);
+        const res = await daemon.call("press", { key: params.key });
         return ok(res, res.action);
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -303,33 +333,18 @@ export default function piComputerUse(pi) {
     parameters: {
       type: "object",
       properties: {
-        direction: {
-          type: "string",
-          enum: ["up", "down", "left", "right"],
-          description: "Default down",
-        },
+        direction: { type: "string", enum: ["up", "down", "left", "right"], description: "Default down" },
         amount: { type: "number", description: "Pixels, default 600" },
-        target: {
-          description: "Optional element to move the cursor to first",
-          anyOf: [
-            { type: "number" },
-            { type: "string" },
-            {
-              type: "object",
-              properties: { x: { type: "number" }, y: { type: "number" } },
-              required: ["x", "y"],
-            },
-          ],
-        },
+        target: { ...TARGET_SCHEMA, description: "Optional element to move the cursor to first" },
       },
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        let target = params.target ?? null;
-        if (typeof target === "string" && /^\d+$/.test(String(target).trim())) target = Number(target);
-        const res = await s.scroll({ direction: params.direction ?? "down", amount: params.amount ?? 600, target });
+        const res = await daemon.call("scroll", {
+          direction: params.direction ?? "down",
+          amount: params.amount ?? 600,
+          target: params.target === undefined ? undefined : targetOf(params.target),
+        });
         return ok(res, res.action);
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -340,8 +355,7 @@ export default function piComputerUse(pi) {
   pi.registerTool({
     name: "browser_screenshot",
     label: "Screenshot",
-    description:
-      "Capture the visible page as a PNG so you can see what the human sees, including the ghost cursor.",
+    description: "Capture the current browser view as a PNG image you can look at.",
     promptSnippet: "Capture the browser as a PNG to visually inspect it",
     promptGuidelines: [
       "Use browser_screenshot when layout, styling, or canvas rendering matters; use browser_snapshot for structure.",
@@ -354,15 +368,10 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        const buf = await s.screenshot({ fullPage: params.fullPage ?? false });
+        const res = await daemon.call("screenshot", { fullPage: params.fullPage });
         return {
-          content: [
-            { type: "image", data: buf.toString("base64"), mimeType: "image/png" },
-            text(`${s.page.url()}\n${s.actionCount} actions this session`),
-          ],
-          details: { ok: true, url: s.page.url() },
+          content: [{ type: "image", data: res.base64, mimeType: "image/png" }],
+          details: { bytes: Math.floor((res.base64.length * 3) / 4) },
         };
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -373,12 +382,8 @@ export default function piComputerUse(pi) {
   pi.registerTool({
     name: "browser_eval",
     label: "Evaluate JS",
-    description:
-      "Run JavaScript in the page and return the result. Use for reading state the snapshot misses.",
+    description: "Evaluate a JavaScript expression or function body inside the page and return its value.",
     promptSnippet: "Evaluate JavaScript in the page",
-    promptGuidelines: [
-      "Pass browser_eval a bare function body or expression that evaluates in the page; it cannot access Node.",
-    ],
     parameters: {
       type: "object",
       properties: {
@@ -388,9 +393,7 @@ export default function piComputerUse(pi) {
     },
     async execute(_id, params) {
       try {
-        const s = getSession();
-        await s.ensure();
-        const res = await s.evaluate(params.script);
+        const res = await daemon.call("eval", { script: params.script });
         return ok(res, `Result: ${JSON.stringify(res.value).slice(0, 600)}`);
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -401,14 +404,21 @@ export default function piComputerUse(pi) {
   pi.registerTool({
     name: "browser_close",
     label: "Close browser",
-    description: "Close the browser and stop the live view stream.",
-    promptSnippet: "Close the browser session",
+    description:
+      "Close the browser and stop the daemon. Only call this when the user explicitly asks to " +
+      "close the browser, or the task is completely finished and they no longer want it open.",
+    promptSnippet: "Close the persistent browser (rarely — only when explicitly asked)",
+    promptGuidelines: [
+      "Do not call browser_close to tidy up. Leaving it open is the intended end state: the user can keep watching and the next turn reuses the same page.",
+      "Call browser_close only when the user asks you to close the browser or stop watching.",
+    ],
     parameters: { type: "object", properties: {} },
     async execute() {
       try {
-        if (!session) return ok({ ok: true }, "No browser was running.");
-        await session.close();
-        session = null;
+        const ping = await daemon.ping();
+        if (!ping) return ok({ ok: true }, "No browser was running.");
+        await daemon.stop();
+        daemon.socket = null;
         return ok({ ok: true }, "Browser closed.");
       } catch (err) {
         return fail(err.message ?? String(err));

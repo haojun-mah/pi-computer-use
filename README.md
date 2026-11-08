@@ -3,10 +3,14 @@
 **A browser Pi can drive that you can actually watch.**
 
 Pi's browser automation runs headless, so every click happens in a window nobody
-can see. This package runs a real headed Chromium instead, draws an animated
-ghost cursor into the page, and streams the whole session to a viewer you open
+can see. This package runs a real headed Chromium instead, draws an animated ghost
+cursor into the page, and streams the whole session to a viewer you open
 locally — so you can follow along, catch a wrong click before it matters, and
 trust what the agent did.
+
+The browser is also **long-lived**. It runs in a detached daemon, so finishing a
+turn, ending a session, or closing the terminal leaves it open. A browsing task is
+one continuous visible session, not a sequence of launches.
 
 ![The ghost cursor and action label on a live page](docs/ghost-cursor.png)
 
@@ -15,13 +19,16 @@ And the live view, streaming to your own browser:
 ![The live view UI](docs/live-view.png)
 
 ```
-   ┌─────────────────────────────┐        ┌──────────────────────┐
-   │  headed Chromium            │        │  your browser        │
-   │  ┌───────────────────────┐  │  SSE   │  ┌────────────────┐  │
-   │  │ page + ghost cursor   │──┼───────▶│  │  live view     │  │
-   │  │  ↖ animated pointer   │  │ frames │  │  click to take │  │
-   │  └───────────────────────┘  │        │  │  over          │  │
-   └─────────────────────────────┘        └──────────────────────┘
+   ┌──────────────────────────────┐        ┌──────────────────────┐
+   │  detached daemon (survives)  │        │  your browser        │
+   │  ┌────────────────────────┐  │  SSE   │  ┌────────────────┐  │
+   │  │ headed Chromium        │──┼───────▶│  │  live view     │  │
+   │  │ page + ghost cursor    │  │ frames │  │  click to take │  │
+   │  │  ↖ animated pointer    │  │        │  │  over          │  │
+   │  └────────────────────────┘  │        │  └────────────────┘  │
+   └──────────────▲───────────────┘        └──────────────────────┘
+                  │ unix socket
+        pi turn ──┴── pi turn ── pi turn
 ```
 
 ## Why
@@ -32,13 +39,14 @@ Pi had no equivalent: `@playwright/mcp` launches with `--headless`, its tools ac
 on accessibility refs, and nothing is ever drawn. The work was correct but
 invisible.
 
-This package closes that gap with three pieces:
+This package closes that gap with four pieces:
 
 | Piece | What it does |
 | --- | --- |
 | **Ghost cursor** | An animated pointer, click ripple, element highlight and action label drawn *inside the page*. |
 | **Real input** | Every click and keypress goes through `page.mouse` / `page.keyboard`, so events stay `isTrusted: true`. The cursor annotates; it never substitutes. |
 | **Live view** | A local web page streaming JPEG frames over SSE, with click-to-takeover. Works over SSH with one port forward. |
+| **Daemon** | The browser lives in a detached process, so it outlives any one Pi turn, session, or terminal. |
 
 Optional fourth piece: `osPointer: true` moves the **real hardware cursor**
 through X11 `XTest`, reproducing Codex's desktop takeover.
@@ -73,11 +81,12 @@ Just ask, or be explicit:
 open a browser and show me the pricing page
 ```
 
-The model gets nine tools:
+The model gets ten tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `browser_open` | Launch the visible browser and load a URL. Returns the live view URL. |
+| `browser_open` | Launch the persistent visible browser and load a URL. Returns the live view URL. |
+| `browser_act` | **Run a sequence of actions in one burst** — click, type, press, scroll, navigate, wait. |
 | `browser_snapshot` | Page text plus interactive elements, each with a numeric `ref`. |
 | `browser_click` | Move cursor → pause → ripple → real click. Takes a ref, selector, or `{x,y}`. |
 | `browser_type` | Focus with a visible move, then type at a human cadence. |
@@ -85,9 +94,43 @@ The model gets nine tools:
 | `browser_scroll` | Scroll, optionally moving the cursor to a target first. |
 | `browser_screenshot` | PNG back to the model, including the ghost cursor. |
 | `browser_eval` | Evaluate JavaScript in the page. |
-| `browser_close` | Close the browser and stop the stream. |
+| `browser_close` | Close the browser and stop the daemon. Rarely needed. |
 
 Plus `/browser` to print the live view URL, and `/browser --open` to launch it.
+
+### One browser, many turns
+
+The browser is **not** reopened per step. It runs in a detached daemon that
+outlives every Pi process, so the intended flow is:
+
+```
+turn 1   browser_open  → the page is up, and stays up
+turn 2   browser_snapshot → same page, same cookies, same scroll
+turn 3   browser_act   → three clicks in one visible burst
+turn ... done. the browser is still open.
+```
+
+Closing the terminal does not close it. `session_shutdown` deliberately does not
+touch it — that hook was the bug that made the first version cycle the browser on
+every exit. Only `browser_close`, or `npx pi-computer-use stop`, ends a session.
+
+### Prefer `browser_act`
+
+Each individual tool call is a round-trip through the model. Five clicks in five
+calls means five pauses where a human watches a motionless page. `browser_act`
+takes the whole sequence at once, so the cursor keeps moving:
+
+```json
+{ "steps": [
+  { "action": "click",  "target": 3 },
+  { "action": "type",   "target": 4, "text": "hello@example.com" },
+  { "action": "click",  "target": 7 }
+]}
+```
+
+Results come back per step (`1. ok click — clicked ref 3 …`), so a failure in the
+middle is visible without losing the steps that succeeded. Pass
+`stopOnError: true` when later steps depend on earlier ones.
 
 ### Watching it
 
@@ -136,8 +179,9 @@ install time.
 ## How it fits together
 
 ```
-src/index.js      the extension: nine tools + /browser
-src/session.js    BrowserSession: launch, serialized actions, snapshots
+src/index.js      the extension: ten tools + /browser
+src/daemon.js     detached browser process + unix-socket client
+src/session.js    BrowserSession: launch, serialized actions, snapshots, act()
 src/overlay.js    the in-page ghost cursor (injected at document start)
 src/liveview.js   HTTP server: /, /stream (SSE), /frame.jpg, /input
 src/os-pointer.js optional XTest helper, compiled once on first use
@@ -147,6 +191,11 @@ Actions are serialized through one queue so two clicks can never interleave — 
 a human watching, overlapping cursors would be worse than slow ones. Frame grabs
 deliberately bypass that queue: a dropped frame beats a stalled stream.
 
+The daemon is a separate concern from the queue: the queue orders actions *within*
+a burst, the daemon keeps the browser alive *between* bursts. State lives in
+`~/.pi/agent/computer-use/` — `daemon.sock`, `daemon.json`, and the Chromium
+profile — so a restarted Pi picks up the same page, cookies and all.
+
 ## Caveats
 
 - The overlay lives in the page, so a page that replaces `document.documentElement`
@@ -155,6 +204,11 @@ deliberately bypass that queue: a dropped frame beats a stalled stream.
   window by hand offsets the hardware cursor.
 - The live view binds to `127.0.0.1` only. It has no authentication, by design —
   forward the port, do not expose it.
+- The daemon is per-user, not per-project. Two Pi sessions share one browser, which
+  is usually what you want, but it does mean a second session will join a page the
+  first one is using. `npx pi-computer-use stop` is the reset.
+- If the live view port is taken, it walks forward (7799, 7800, …) instead of
+  failing. The URL reported is the one it actually bound.
 
 ### On Wayland / Xwayland
 

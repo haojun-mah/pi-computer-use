@@ -169,13 +169,20 @@ if (!cmd || cmd === "doctor") {
     console.error(`${C.red}${err.message}${C.off}`);
     process.exit(1);
   });
+} else if (cmd === "status" || cmd === "stop") {
+  awaitDaemon(cmd);
+} else if (cmd === "view") {
+  awaitDaemon("view");
 } else if (cmd === "--help" || cmd === "-h" || cmd === "help") {
   console.log(`
 pi-computer-use — a watchable browser for Pi
 
 Usage:
-  pi-computer-use doctor     Check this machine can run it
-  pi-computer-use demo [url] Open a browser with the live view
+  pi-computer-use doctor          Check this machine can run it
+  pi-computer-use demo [url]      Open a browser with the live view
+  pi-computer-use status          Is the persistent browser running?
+  pi-computer-use view            Print the live view URL
+  pi-computer-use stop            Close the browser and stop the daemon
 
 Environment:
   DISPLAY           X display for headed mode (auto-detected)
@@ -183,6 +190,38 @@ Environment:
   PI_CU_PORT        Live view port (default 7799)
 `);
 } else {
-  console.error(`Unknown command: ${cmd}. Try: doctor | demo | help`);
+  console.error(`Unknown command: ${cmd}. Try: doctor | demo | status | view | stop | help`);
   process.exit(1);
+}
+
+/**
+ * Daemon control. Kept in the CLI so the browser can be inspected and stopped
+ * from a shell, without a Pi session and without a model in the loop.
+ */
+async function awaitDaemon(what) {
+  const { DaemonClient } = await import("../src/daemon.js");
+  const client = new DaemonClient({ spawnIfMissing: false });
+  const ping = await client.ping();
+  if (!ping) {
+    console.log("No browser daemon running. Start one with `pi-computer-use demo` or by calling browser_open.");
+    process.exit(what === "status" ? 1 : 0);
+  }
+  if (what === "stop") {
+    await client.stop();
+    console.log("Browser closed, daemon stopped.");
+    return;
+  }
+  const info = ping.info;
+  if (what === "view") {
+    console.log(info.liveView ?? "(no live view — browser not open)");
+    client.disconnect();
+    return;
+  }
+  console.log(`daemon pid   ${ping.pid}`);
+  console.log(`browser      ${info.running ? "open" : "not started"}`);
+  console.log(`url          ${info.url ?? "—"}`);
+  console.log(`display      ${info.display ?? "headless"}`);
+  console.log(`live view    ${info.liveView ?? "—"}`);
+  console.log(`actions      ${info.actions}`);
+  client.disconnect();
 }
