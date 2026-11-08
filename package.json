@@ -1,0 +1,69 @@
+{
+  "name": "pi-computer-use",
+  "version": "0.1.0",
+  "description": "Watch Pi drive a real browser: headed Chromium with an animated ghost cursor, click ripples, and a live stream you can open in your own browser.",
+  "type": "module",
+  "license": "MIT",
+  "author": "haojun-mah",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "computer-use",
+    "browser-automation",
+    "playwright",
+    "ai-agent"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/haojun-mah/pi-computer-use.git"
+  },
+  "homepage": "https://github.com/haojun-mah/pi-computer-use#readme",
+  "bugs": {
+    "url": "https://github.com/haojun-mah/pi-computer-use/issues"
+  },
+  "bin": {
+    "pi-computer-use": "./bin/cli.js"
+  },
+  "files": [
+    "src",
+    "bin",
+    "skills",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.js"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "demo": "node examples/demo.mjs",
+    "doctor": "node bin/cli.js doctor"
+  },
+  "dependencies": {
+    "playwright-core": "^1.65.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}
