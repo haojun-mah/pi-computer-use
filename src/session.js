@@ -68,6 +68,10 @@ const DEFAULT_OPTS = {
   cursorSpeedMs: 180,
   clickDelayMs: 45,
   liveViewPort: 7799,
+  // Chromium's screencast is change-driven, so this is a ceiling on burst rate
+  // rather than a target. 20 is smooth motion without flooding a remote viewer
+  // over SSH; 43 fps was measurable but wasteful for a human eye watching.
+  liveViewMaxFps: 20,
   liveView: true,
   osPointer: false,
   display: null,
@@ -82,6 +86,7 @@ export class BrowserSession {
     this.display = null;
     this.liveView = null;
     this.osPointer = null;
+    this._cast = null;
     this.cursor = { x: 40, y: 40 };
     this.startedAt = null;
     this.lastAction = null;
@@ -177,7 +182,11 @@ export class BrowserSession {
       this.liveView = new LiveView({
         port: this.opts.liveViewPort,
         session: this,
+        maxFps: this.opts.liveViewMaxFps,
       });
+      // If the cast dies mid-session (crash, closed target, renderer swap the
+      // browser refuses), fall back to polling instead of freezing the viewer.
+      this.onScreencastLost = () => this.liveView?._startCapture?.();
       await this.liveView.start().catch(() => {});
     }
 
@@ -282,12 +291,24 @@ export class BrowserSession {
     if (!box) throw new Error(`Target "${desc}" is not visible (zero bounding box).`);
 
     const text = (await locator.innerText({ timeout: 1000 }).catch(() => "")) || "";
+    // A selector is an implementation detail; the viewer watching the cursor move
+    // wants the words they can see on screen. Prefer the visible label, then the
+    // accessible name, and only fall back to the raw selector.
+    const shown = text.trim().replace(/\s+/g, " ").slice(0, 40);
+    const named = await locator
+      .evaluate((el) => el.getAttribute("aria-label") || el.getAttribute("placeholder") || el.getAttribute("alt") || "")
+      .catch(() => "");
+    const label = shown || (named || "").trim().slice(0, 40);
     return {
       x: Math.round(box.x + box.width / 2),
       y: Math.round(box.y + box.height / 2),
       box,
       element: locator,
-      desc: text ? `${desc} "${text.slice(0, 40).replace(/\s+/g, " ")}"` : desc,
+      // `desc` names the target for the agent; `label` is what the watching human
+      // should read under the cursor. They differ because a selector like
+      // `a[itemprop="name codeRepository"]` means nothing to a person.
+      label: label || desc,
+      desc: label ? `${desc} "${label}"` : desc,
     };
   }
 
@@ -399,7 +420,7 @@ export class BrowserSession {
     return this._serial(async () => {
       await this.ensure();
       const t = await this.resolveTarget(target);
-      await this._moveCursor(t.x, t.y, { label: label ?? `click ${shorten(t.desc)}` });
+      await this._moveCursor(t.x, t.y, { label: label ?? `click ${shorten(t.label, 28).replace(/^"|"$/g, "")}` });
       await this.page.waitForTimeout(this.opts.clickDelayMs);
       await this._ripple(t.x, t.y, clickCount === 2 ? "double" : "click");
       await this.page.mouse.move(t.x, t.y);
@@ -422,7 +443,7 @@ export class BrowserSession {
     return this._serial(async () => {
       await this.ensure();
       const t = await this.resolveTarget(target);
-      await this._moveCursor(t.x, t.y, { label: `hover ${shorten(t.desc)}` });
+      await this._moveCursor(t.x, t.y, { label: `hover ${shorten(t.label)}` });
       await this.page.mouse.move(t.x, t.y);
       if (t.element) await t.element.hover({ timeout: 5000 }).catch(() => {});
       await this._pulse();
@@ -435,7 +456,7 @@ export class BrowserSession {
     return this._serial(async () => {
       await this.ensure();
       const t = await this.resolveTarget(target);
-      await this._moveCursor(t.x, t.y, { label: `type ${shorten(t.desc)}` });
+      await this._moveCursor(t.x, t.y, { label: `type ${shorten(t.label)}` });
       await this.page.waitForTimeout(this.opts.clickDelayMs);
       await this._ripple(t.x, t.y);
       await this.page.mouse.click(t.x, t.y);
@@ -488,7 +509,7 @@ export class BrowserSession {
     return this._serial(async () => {
       await this.ensure();
       const t = await this.resolveTarget(target);
-      await this._moveCursor(t.x, t.y, { label: `select ${shorten(t.desc)}` });
+      await this._moveCursor(t.x, t.y, { label: `select ${shorten(t.label)}` });
       await this._ripple(t.x, t.y);
       const picked = await t.element.selectOption(values);
       await this._pulse();
@@ -685,7 +706,85 @@ export class BrowserSession {
     return data;
   }
 
+  /**
+   * Live frames from CDP's own screencast, with the browser doing the work.
+   *
+   * Screenshot polling re-composites and re-encodes a full frame on a timer,
+   * whether or not anything moved, which is why it cost 1.39 cores to produce
+   * 11.8 fps. Chromium's screencast is change-driven and hands back the already
+   * composited surface, overlay included, so it produced the same 11.8 fps for
+   * 0.75 cores and reached 43 fps when the cap was lifted.
+   *
+   * Frames arrive only when the picture changes, so a still page stays still
+   * and a moving cursor actually animates. Returns false when the transport is
+   * unavailable (non-Chromium, or a page that vanished mid-setup) and the caller
+   * should fall back to polling.
+   */
+  async startScreencast({ quality = 60, maxFps = 20, onFrame } = {}) {
+    if (this._cast) return true;
+    await this.ensure();
+    if (!this.context || typeof this.context.newCDPSession !== "function") return false;
+
+    let cdp;
+    try {
+      cdp = await this.context.newCDPSession(this.page);
+    } catch {
+      return false;
+    }
+
+    const minGap = maxFps > 0 ? 1000 / maxFps : 0;
+    let lastAt = 0;
+
+    // A page crash or a closed target detaches the session. Without this the
+    // viewer sits on a frozen image and never learns why, because nothing else
+    // asks the session any questions once the cast is running.
+    cdp.on("close", () => {
+      if (this._cast?.cdp === cdp) this._cast = null;
+      this.onScreencastLost?.();
+    });
+
+    cdp.on("Page.screencastFrame", (ev) => {
+      const now = Date.now();
+      // Ack every frame, kept or not. Chromium pauses the pipeline until the
+      // previous frame is acked, so withholding one to enforce the rate limit
+      // would stall the stream instead of thinning it.
+      cdp.send("Page.screencastFrameAck", { sessionId: ev.sessionId }).catch(() => {});
+      if (minGap && now - lastAt < minGap) return;
+      lastAt = now;
+      try {
+        onFrame(Buffer.from(ev.data, "base64"), now);
+      } catch {
+        /* a viewer that throws must not kill the cast */
+      }
+    });
+
+    try {
+      await cdp.send("Page.startScreencast", {
+        format: "jpeg",
+        quality,
+        maxWidth: this.opts.viewport.width,
+        maxHeight: this.opts.viewport.height,
+        everyNthFrame: 1,
+      });
+    } catch {
+      await cdp.detach().catch(() => {});
+      return false;
+    }
+
+    this._cast = { cdp, quality, maxFps };
+    return true;
+  }
+
+  async stopScreencast() {
+    const cast = this._cast;
+    if (!cast) return;
+    this._cast = null;
+    await cast.cdp.send("Page.stopScreencast").catch(() => {});
+    await cast.cdp.detach().catch(() => {});
+  }
+
   async close() {
+    await this.stopScreencast();
     if (this.liveView) await this.liveView.stop().catch(() => {});
     if (this.osPointer) this.osPointer.close();
     if (this.browser) await this.browser.close().catch(() => {});

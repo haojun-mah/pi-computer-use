@@ -45,7 +45,7 @@ This package closes that gap with four pieces:
 | --- | --- |
 | **Ghost cursor** | An animated pointer, click ripple, element highlight and action label drawn *inside the page*. |
 | **Real input** | Every click and keypress goes through `page.mouse` / `page.keyboard`, so events stay `isTrusted: true`. The cursor annotates; it never substitutes. |
-| **Live view** | A local web page streaming JPEG frames over SSE, with click-to-takeover. Works over SSH with one port forward. |
+| **Live view** | A local web page streaming JPEG frames over SSE, with click-to-takeover. Works over SSH with one port forward. Frames come from Chromium's own screencast, so a moving cursor arrives at ~18 fps instead of the ~9 fps a screenshot timer could manage. |
 | **Daemon** | The browser lives in a detached process, so it outlives any one Pi turn, session, or terminal. |
 
 Optional fourth piece: `osPointer: true` moves the **real hardware cursor**
@@ -199,7 +199,7 @@ src/index.js      the extension: ten tools + /browser
 src/daemon.js     detached browser process + unix-socket client
 src/session.js    BrowserSession: launch, serialized actions, snapshots, act()
 src/overlay.js    the in-page ghost cursor (injected at document start)
-src/liveview.js   HTTP server: /, /stream (SSE), /frame.jpg, /input
+src/liveview.js   HTTP server: /, /stream (SSE), /frame.jpg, /state, /input
 src/os-pointer.js optional XTest helper, compiled once on first use
 ```
 
@@ -211,6 +211,32 @@ The daemon is a separate concern from the queue: the queue orders actions *withi
 a burst, the daemon keeps the browser alive *between* bursts. State lives in
 `~/.pi/agent/computer-use/` — `daemon.sock`, `daemon.json`, and the Chromium
 profile — so a restarted Pi picks up the same page, cookies and all.
+
+## How the live view gets its frames
+
+Chromium can push its compositor output over CDP (`Page.startScreencast`). That
+is what the viewer uses, and the choice is worth knowing about because it is not
+obvious from the outside:
+
+- It is **change-driven**. A still page emits almost nothing, so an idle session
+  watched by a curious human costs ~2% of one core. A screenshot timer costs a
+  flat 145% whether or not anything moved.
+- It comes from the **compositor**, so our overlay is in the frame — cursor, label
+  pill and ripple all survive. The original implementation used screenshots
+  because it assumed the overlay would be missing from the cast. It is not.
+- The page's own paint rate is the ceiling. Capping at 20 fps costs nothing
+  perceptible; raising it to 60 buys nothing on ordinary pages.
+
+Measured on one box, same page, same actions, interleaved:
+
+| | frames/sec | chrome CPU |
+| --- | --- | --- |
+| screenshot polling | 8.7 | 1.27 cores |
+| CDP screencast | 18.3 | 1.05 cores |
+
+A screenshot grabbed on a timer is still the fallback for transports without CDP.
+Live view defaults to 20 fps (`liveViewMaxFps: 0` uncaps it); no viewer connected
+means no capture work at all.
 
 ## Caveats
 

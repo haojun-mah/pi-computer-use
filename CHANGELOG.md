@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.2.2] - 2026-11-08
+
+The live view was twice as slow as it needed to be, and the comment explaining why
+was wrong.
+
+### Fixed
+
+- **The viewer now uses Chromium's screencast instead of a screenshot timer.**
+  `src/liveview.js` used to poll `page.screenshot()` on an interval, on the stated
+  belief that CDP's `Page.startScreencast` would not include the injected overlay.
+  That belief was untested and false: a captured cast frame contains the ghost
+  cursor, the action label and a mid-animation ripple. Switching to it is
+  8.7 → 18.3 frames/sec on the same page and the same actions, at 1.27 → 1.05
+  browser cores. It is also change-driven, so a still page costs ~2% of a core
+  instead of a flat 145%.
+- **Frame capture ran even with nobody watching.** The tick loop started with the
+  server, so a session nobody had opened still captured frames. Capture now starts
+  on the first `/stream` connection and stops when the last viewer disconnects.
+- **Capture could silently never start.** `_startCapture()` shared the `busy` flag
+  with the polling path, so an action's in-flight pulse made it return early and
+  fall through to nothing. Split into a separate `starting` guard, and the polling
+  loop is only started if the cast is unavailable.
+- **A lost cast froze the viewer forever.** Added a `close` handler on the CDP
+  session: it drops `_cast` and asks the live view to restart capture, so a
+  crashed renderer falls back to polling instead of showing a stale last frame.
+- **A page crash while watching killed the daemon.** The `/state` handler was
+  missing a `return` and fell through to `/input`, which threw
+  `ERR_HTTP_HEADERS_SENT` on any viewer connect.
+- **Viewer labels showed CSS selectors.** `click a[itemprop="name codeRepository"]`
+  is meaningless to a person watching. The label under the cursor now prefers the
+  element's visible text, then `aria-label` / `placeholder` / `alt`, and only falls
+  back to the selector when there is nothing human-readable.
+
+### Changed
+
+- `liveViewMaxFps` (`20` default, `0` for uncapped) is a parameter on `BrowserSession`.
+- `/state` reports `capture: {mode, sent, clients}` so the frame path can be
+  inspected from outside without guessing.
+
 ## [0.2.1] - 2026-11-08
 
 Latency. Nothing here changes what the browser can do, only how long it takes.

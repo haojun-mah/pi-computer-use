@@ -1,6 +1,6 @@
 {
   "name": "pi-computer-use",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Watch Pi drive a real browser: headed Chromium with an animated ghost cursor, click ripples, and a live stream you can open in your own browser.",
   "type": "module",
   "license": "MIT",
