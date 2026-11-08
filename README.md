@@ -156,6 +156,20 @@ deliberately bypass that queue: a dropped frame beats a stalled stream.
 - The live view binds to `127.0.0.1` only. It has no authentication, by design —
   forward the port, do not expose it.
 
+### On Wayland / Xwayland
+
+Under Xwayland the window is real and composited, but grabbing the **root** window
+comes back black, because the compositor owns the scanout. That is a screen-capture
+quirk, not a failure: the window itself is `IsViewable` and its pixels are readable
+directly with `XGetImage`. Two consequences —
+
+- `ffmpeg -f x11grab -i :0` will look black even though the browser is up.
+- `browser_screenshot` and the live view are unaffected: they capture from inside
+  Chromium, never from the root window.
+
+`xlsclients` confirming a `chrome` entry, plus a viewable window of the expected
+size in `xwininfo -root -children`, is the reliable way to check the window exists.
+
 ## License
 
 MIT
