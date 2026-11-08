@@ -43,6 +43,30 @@ function targetOf(t) {
   return t;
 }
 
+/** Render a snapshot for the model. Shared so `act` and `browser_snapshot` agree. */
+function formatSnapshot(snap) {
+  const lines = [
+    `${snap.title || "(untitled)"} — ${snap.url}`,
+    `viewport ${snap.viewport.w}x${snap.viewport.h} · scroll ${snap.scroll.x},${snap.scroll.y}`,
+    "",
+    "Interactive elements:",
+    ...snap.elements.map((e) => {
+      const bits = [`[${e.ref}]`, e.tag];
+      if (e.role) bits.push(`role=${e.role}`);
+      if (e.type) bits.push(`type=${e.type}`);
+      if (e.label) bits.push(JSON.stringify(e.label));
+      if (e.value) bits.push(`value=${JSON.stringify(e.value)}`);
+      bits.push(`@${e.x},${e.y}`);
+      return bits.join(" ");
+    }),
+    "",
+    "Text:",
+    snap.text || "(empty)",
+  ];
+  if (snap.textTruncated) lines.push("(text truncated)");
+  return lines.join("\n");
+}
+
 function openUrl(url) {
   const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
   const args = process.platform === "win32" ? ["/c", "start", "", url] : [url];
@@ -165,7 +189,7 @@ export default function piComputerUse(pi) {
             properties: {
               action: {
                 type: "string",
-                enum: ["click", "type", "press", "scroll", "navigate", "wait"],
+                enum: ["click", "type", "press", "scroll", "navigate", "wait", "snapshot"],
               },
               target: TARGET_SCHEMA,
               text: { type: "string", description: "For action=type" },
@@ -178,6 +202,8 @@ export default function piComputerUse(pi) {
               submit: { type: "boolean", description: "For action=type" },
               label: { type: "string", description: "Cursor label" },
               double: { type: "boolean", description: "For action=click" },
+              maxElements: { type: "number", description: "For action=snapshot" },
+              textLimit: { type: "number", description: "For action=snapshot" },
             },
             required: ["action"],
           },
@@ -190,7 +216,11 @@ export default function piComputerUse(pi) {
       try {
         const steps = (params.steps ?? []).map((s) => ({ ...s, target: s.target === undefined ? undefined : targetOf(s.target) }));
         const res = await daemon.call("act", { steps, stopOnError: params.stopOnError });
-        const lines = res.steps.map((s, i) => `${i + 1}. ${s.ok ? "ok" : "FAILED"} ${s.action} — ${s.summary}`);
+        const lines = [];
+        for (const [i, s] of res.steps.entries()) {
+          lines.push(`${i + 1}. ${s.ok ? "ok" : "FAILED"} ${s.action} — ${s.summary}`);
+          if (s.snapshot) lines.push("", formatSnapshot(s.snapshot));
+        }
         return ok(res, lines.join("\n") || "No steps.");
       } catch (err) {
         return fail(err.message ?? String(err));
@@ -213,30 +243,16 @@ export default function piComputerUse(pi) {
       type: "object",
       properties: {
         maxElements: { type: "number", description: "Cap on interactive elements (default 90)" },
+        textLimit: { type: "number", description: "Cap on body text characters (default 1200). Drop it for 400 when you only need the element list." },
       },
     },
     async execute(_id, params) {
       try {
-        const snap = await daemon.call("snapshot", { maxElements: params.maxElements ?? 90 });
-        const lines = [
-          `${snap.title || "(untitled)"} — ${snap.url}`,
-          `viewport ${snap.viewport.w}x${snap.viewport.h} · scroll ${snap.scroll.x},${snap.scroll.y}`,
-          "",
-          "Interactive elements:",
-          ...snap.elements.map((e) => {
-            const bits = [`[${e.ref}]`, e.tag];
-            if (e.role) bits.push(`role=${e.role}`);
-            if (e.type) bits.push(`type=${e.type}`);
-            if (e.label) bits.push(JSON.stringify(e.label));
-            if (e.value) bits.push(`value=${JSON.stringify(e.value)}`);
-            bits.push(`@${e.x},${e.y}`);
-            return bits.join(" ");
-          }),
-          "",
-          "Text:",
-          snap.text || "(empty)",
-        ];
-        return { content: [text(lines.join("\n"))], details: snap };
+        const snap = await daemon.call("snapshot", {
+          maxElements: params.maxElements ?? 90,
+          textLimit: params.textLimit ?? 1200,
+        });
+        return { content: [text(formatSnapshot(snap))], details: snap };
       } catch (err) {
         return fail(err.message ?? String(err));
       }

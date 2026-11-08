@@ -114,6 +114,10 @@ export class DaemonClient {
         sock.once("error", onErr);
         sock.once("connect", () => {
           sock.off("error", onErr);
+          // Never let this connection keep the host process alive. Pi would
+          // otherwise hang after the last tool call, waiting on a socket that is
+          // idle by design — the daemon outliving us is the whole point.
+          sock.unref();
           this.socket = sock;
           attachDecoder(
             sock,
@@ -314,6 +318,12 @@ async function dispatch(session, method, params) {
       return session.evaluate(params.script);
     case "act":
       return { steps: await session.act(params.steps ?? [], { stopOnError: params.stopOnError }) };
+    case "wait": {
+      await session.ensure();
+      const ms = Math.max(0, Math.min(params.ms ?? 500, 60_000));
+      await session.page.waitForTimeout(ms);
+      return { action: `waited ${ms}ms` };
+    }
     case "screenshot": {
       const buf = await session.screenshot({ fullPage: params.fullPage, path: params.path });
       return { base64: buf.toString("base64") };

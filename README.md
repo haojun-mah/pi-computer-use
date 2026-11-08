@@ -86,7 +86,7 @@ The model gets ten tools:
 | Tool | Purpose |
 | --- | --- |
 | `browser_open` | Launch the persistent visible browser and load a URL. Returns the live view URL. |
-| `browser_act` | **Run a sequence of actions in one burst** — click, type, press, scroll, navigate, wait. |
+| `browser_act` | **Run a sequence in one burst** — click, type, press, scroll, navigate, wait, snapshot. |
 | `browser_snapshot` | Page text plus interactive elements, each with a numeric `ref`. |
 | `browser_click` | Move cursor → pause → ripple → real click. Takes a ref, selector, or `{x,y}`. |
 | `browser_type` | Focus with a visible move, then type at a human cadence. |
@@ -131,6 +131,22 @@ takes the whole sequence at once, so the cursor keeps moving:
 Results come back per step (`1. ok click — clicked ref 3 …`), so a failure in the
 middle is visible without losing the steps that succeeded. Pass
 `stopOnError: true` when later steps depend on earlier ones.
+
+End the sequence with a snapshot step and the whole think → act → see cycle is one
+model round-trip:
+
+```json
+{ "steps": [
+  { "action": "click", "target": 3 },
+  { "action": "type",  "target": 4, "text": "tp" },
+  { "action": "snapshot", "textLimit": 400 }
+]}
+```
+
+That round-trip is the expensive part. On a lazy-warm run here, a plain prompt with
+no browser use at all takes ~9s; a snapshot takes 7ms and a click 130ms. So the
+lever that matters is *calling the browser less often*, not making each call
+faster — though both are worth doing.
 
 ### Watching it
 

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.2.1] - 2026-11-08
+
+Latency. Nothing here changes what the browser can do, only how long it takes.
+
+### Fixed
+
+- **Pi hung after the last tool call.** The daemon socket was ref'd, so an idle
+  connection kept the host process alive and every session paid the full timeout
+  doing nothing. `sock.unref()` — the daemon outliving us is the point.
+- **A stale ref cost a 10-second stall.** `locator.waitFor` auto-waits, so asking
+  about an element that no longer exists burned the entire timeout before failing.
+  Replaced with a `querySelector` existence probe plus a cheap re-tag retry:
+  10,000ms → 3ms, and the error now says "call browser_snapshot again" instead of
+  timing out silently.
+- A bogus selector cost the same 10s; it now fails in 1.5s.
+
+### Changed
+
+- **`browser_act` can take a `snapshot` step**, so a whole think → act → see cycle
+  is one tool call instead of two. This is the biggest win on a real task, because
+  it removes a full model round-trip rather than a few milliseconds.
+- Snapshot body text defaults to 1200 chars, down from 2500, with
+  `textLimit` to control it. A snapshot is re-sent on every later turn, so the
+  tail of a page's nav chrome was being paid for repeatedly.
+- Cursor glide 340ms → 180ms, pre-click pause 120ms → 45ms, settle 60ms → 30ms.
+  Click latency halved (250ms → 130ms). A 180ms move is just as legible; the
+  longer ones were simulating a slow hand rather than communicating intent.
+- `wait` is available as a top-level daemon method, not only inside `act`.
+
+### Notes
+
+Measured on this machine, per action: snapshot 7ms, navigate 62ms, click 130ms,
+four-step `act` including a snapshot 923ms. A plain prompt with no browser use at
+all takes ~9s, so most of the wall-clock time in a browsing task is model latency,
+not the browser. The fixes above target the round-trips that multiply it.
+
 ## [0.2.0] - 2026-11-08
 
 The browser is now continuous. It used to be relaunched for every step, which made

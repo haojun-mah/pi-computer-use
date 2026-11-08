@@ -62,8 +62,11 @@ const DEFAULT_OPTS = {
   viewport: { width: 1280, height: 800 },
   windowPosition: [80, 60],
   profileDir: join(homedir(), ".pi", "agent", "computer-use", "profile"),
-  cursorSpeedMs: 340,
-  clickDelayMs: 120,
+  // Cursor travel is a perceptual cue, not a real-time simulation. 340ms of
+  // glide per click, on top of a 120ms pre-click pause, made every click feel
+  // sluggish for no gain in legibility: the eye reads a 180ms move just fine.
+  cursorSpeedMs: 180,
+  clickDelayMs: 45,
   liveViewPort: 7799,
   liveView: true,
   osPointer: false,
@@ -235,7 +238,8 @@ export class BrowserSession {
 
     let locator;
     let desc;
-    if (typeof target === "number") {
+    const isRef = typeof target === "number";
+    if (isRef) {
       locator = page.locator(`[data-pi-ref="${target}"]`).first();
       desc = `ref ${target}`;
     } else if (typeof target === "string" && target.trim()) {
@@ -245,12 +249,39 @@ export class BrowserSession {
       throw new Error("No target given. Pass a ref from `snapshot`, a selector, or {x,y}.");
     }
 
-    await locator.waitFor({ state: "attached", timeout: 10000 });
-    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    // Probe existence directly in the page rather than through the locator.
+    // Locator calls auto-wait, so asking one about an element that is not there
+    // costs the entire timeout; a querySelector probe costs microseconds. That
+    // difference is the whole latency budget when a ref has gone stale.
+    const existsNow = () =>
+      page
+        .evaluate((sel) => Boolean(document.querySelector(sel)), isRef ? `[data-pi-ref="${target}"]` : target)
+        .catch(() => false);
+
+    if (!(await existsNow())) {
+      if (isRef) {
+        // A missing ref is nearly always a re-render, not a missing element:
+        // re-tagging is one cheap evaluate and recovers the common case.
+        const recovered = await this._retag(target);
+        if (!recovered) {
+          throw new Error(
+            `ref ${target} is gone — the page changed since your last snapshot. ` +
+              `Call browser_snapshot again and use a fresh ref.`,
+          );
+        }
+      } else {
+        await locator.waitFor({ state: "attached", timeout: 1500 }).catch(() => {});
+        if (!(await existsNow())) {
+          throw new Error(`no element matched ${JSON.stringify(desc)} on the current page.`);
+        }
+      }
+    }
+
+    await locator.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
     const box = await locator.boundingBox();
     if (!box) throw new Error(`Target "${desc}" is not visible (zero bounding box).`);
 
-    const text = (await locator.innerText().catch(() => "")) || "";
+    const text = (await locator.innerText({ timeout: 1000 }).catch(() => "")) || "";
     return {
       x: Math.round(box.x + box.width / 2),
       y: Math.round(box.y + box.height / 2),
@@ -258,6 +289,58 @@ export class BrowserSession {
       element: locator,
       desc: text ? `${desc} "${text.slice(0, 40).replace(/\s+/g, " ")}"` : desc,
     };
+  }
+
+  /**
+   * Re-apply ref tags without paying for a full snapshot round-trip.
+   *
+   * Ref numbering is deterministic for an unchanged DOM, so re-tagging is enough
+   * to recover a ref after a re-render that kept the same structure. If the
+   * document really changed, the caller's retry fails fast with a clear message
+   * instead of hanging on a selector.
+   */
+  async _retag(wantRef) {
+    if (!this.page || this.page.isClosed()) return;
+    const found = await this.page
+      .evaluate(
+        ([want, limit]) => {
+          const sel = [
+            "a[href]",
+            "button",
+            "input:not([type=hidden])",
+            "select",
+            "textarea",
+            "summary",
+            "[role=button]",
+            "[role=link]",
+            "[role=checkbox]",
+            "[role=tab]",
+            "[role=menuitem]",
+            "[contenteditable=true]",
+            "[onclick]",
+          ].join(",");
+          document.querySelectorAll("[data-pi-ref]").forEach((n) => n.removeAttribute("data-pi-ref"));
+          let ref = 0;
+          const seen = new Set();
+          for (const el of document.querySelectorAll(sel)) {
+            if (ref >= limit) break;
+            if (seen.has(el)) continue;
+            seen.add(el);
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) continue;
+            if (r.bottom < -200 || r.top > window.innerHeight + 800) continue;
+            const cs = getComputedStyle(el);
+            if (cs.visibility === "hidden" || cs.display === "none" || cs.opacity === "0") continue;
+            ref += 1;
+            el.setAttribute("data-pi-ref", String(ref));
+            if (ref === want) return true;
+          }
+          return false;
+        },
+        [wantRef, 200],
+      )
+      .catch(() => false);
+    return found;
   }
 
   // ---------------------------------------------------------------- actions ---
@@ -296,10 +379,13 @@ export class BrowserSession {
             await this.page.waitForTimeout(step.ms ?? 500);
             r = this._describe(`waited ${step.ms ?? 500}ms`);
             break;
+          case "snapshot":
+            r = { action: "snapshot", snapshot: await this.snapshot({ maxElements: step.maxElements, textLimit: step.textLimit }) };
+            break;
           default:
             throw new Error(`unknown action ${JSON.stringify(action)}`);
         }
-        results.push({ action, ok: true, summary: r.action });
+        results.push({ action, ok: true, summary: r.action, ...(r.snapshot ? { snapshot: r.snapshot } : {}) });
       } catch (err) {
         results.push({ action, ok: false, summary: err.message ?? String(err) });
         if (stopOnError) break;
@@ -326,7 +412,7 @@ export class BrowserSession {
         await this.page.mouse.down({ button });
         await this.page.mouse.up({ button });
       }
-      await this.page.waitForTimeout(60);
+      await this.page.waitForTimeout(30);
       await this._pulse();
       return this._describe(`clicked ${t.desc} at ${t.x},${t.y}`);
     });
@@ -525,9 +611,9 @@ export class BrowserSession {
    * get a stable `data-pi-ref` so the model can act by ref instead of guessing
    * selectors — the same affordance Playwright MCP gets from its snapshot.
    */
-  async snapshot({ maxElements = 90 } = {}) {
+  async snapshot({ maxElements = 90, textLimit = 1200 } = {}) {
     await this.ensure();
-    const data = await this.page.evaluate((limit) => {
+    const data = await this.page.evaluate(({ limit, textLimit }) => {
       document.querySelectorAll("[data-pi-ref]").forEach((n) => n.removeAttribute("data-pi-ref"));
       const sel = [
         "a[href]",
@@ -580,6 +666,9 @@ export class BrowserSession {
         });
       }
 
+      // Interactive labels already describe what can be done here, so the raw
+      // body text is mostly duplication. Keep it short by default: a snapshot is
+      // re-sent on every turn, and 2500 chars of nav chrome is pure overhead.
       const textOf = document.body ? document.body.innerText : "";
       return {
         url: location.href,
@@ -587,9 +676,10 @@ export class BrowserSession {
         viewport: { w: window.innerWidth, h: window.innerHeight },
         scroll: { x: Math.round(scrollX), y: Math.round(scrollY) },
         elements: items,
-        text: textOf.replace(/\n{3,}/g, "\n\n").slice(0, 2500),
+        text: textOf.replace(/\n{3,}/g, "\n\n").slice(0, textLimit),
+        textTruncated: textOf.length > textLimit,
       };
-    }, maxElements);
+    }, { maxElements, textLimit });
 
     data.cursor = this.cursor;
     return data;

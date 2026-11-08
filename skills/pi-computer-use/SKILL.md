@@ -61,6 +61,10 @@ Order of preference for any `target`:
 Refs are reassigned on every `browser_snapshot` call. Re-snapshot after a
 navigation or a DOM change rather than reusing an old ref.
 
+If a ref has gone stale you get a fast, explicit error — `ref 12 is gone — the page
+changed since your last snapshot` — rather than a timeout. Take the snapshot and
+retry; do not fall back to guessing selectors.
+
 ## Etiquette that keeps it watchable
 
 - Batch with `browser_act` when the steps are decided. A human watching a page sit
@@ -68,6 +72,9 @@ navigation or a DOM change rather than reusing an old ref.
   actions in one `browser_act` move continuously and read as intent.
 - Still snapshot between *decisions*. Burst the mechanical actions; think between
   bursts.
+- End a `browser_act` with a `{"action":"snapshot"}` step when you will need to look
+  afterwards. One call instead of two removes an entire model round-trip, which is
+  the dominant cost — not the browser, which answers in milliseconds.
 - Let `browser_open` keep `headless: false`. Only force headless for speed when
   nobody is looking.
 - `osPointer: true` additionally moves the real hardware cursor. It needs an X11
